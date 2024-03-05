@@ -1,0 +1,171 @@
+#pragma kernel CSMain
+#pragma kernel Update
+
+struct SlimeAgent
+{
+    float2 position;
+    float angle;
+};
+RWTexture2D<float4> Result;
+RWStructuredBuffer<SlimeAgent> Agents;
+int2 imageSize;
+#define PI 3.14159265358979323846
+
+uint RandomSeed;
+uint rngState;
+uint NextRandom(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result;
+}
+
+float rand()
+{
+    return frac(NextRandom(rngState) / 4294967295.0); // 2^32 - 1
+}
+
+// Function to generate a normalized and random direction
+float2 GenerateRandomDirection()
+{
+    float angle = rand() * 2.0f * 3.14159f; // Random angle in radians
+    return normalize(float2(cos(angle), sin(angle))); // Convert polar coordinates to Cartesian and normalize
+}
+
+float SensePositon(float2 position, float radius)
+{
+    float sum = 0.0;
+    float totalWeight = 0;
+
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            float2 offset = float2(x, y);
+            float2 currentPos = position + offset;
+            float4 pixel = float4(0, 0, 0, 1);
+            float weight = 1.0 - length(offset) / radius;
+            if (currentPos.x >= 0.0 && currentPos.y >= 0.0 && currentPos.x < float(imageSize.x) && currentPos.y < float(imageSize.y))
+            {
+                pixel = Result[int2(currentPos.x, currentPos.y)];
+            }
+            sum += weight * pixel.x;
+            totalWeight += weight;
+        }
+    }
+
+    return sum / totalWeight;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    rngState = id.x * id.y * id.z + RandomSeed;
+    float2 normalizedID = float2(id.x / (float)imageSize.x, id.y / (float)imageSize.y);
+    float4 blurColor = 0;
+    int blurSize = 1;  // Define the blur size
+    float weightSum = 0; // Sum of weights for normalization
+
+    // Iterate over the blur kernel
+    for(int i = -blurSize; i <= blurSize; i++)
+    {
+        for(int j = -blurSize; j <= blurSize; j++)
+        {
+            uint3 offsetID = uint3(id.x + i, id.y + j, id.z);
+            // Calculate the weight based on the distance from the center pixel
+            float weight = 1.0f / (1.0f + pow(i*i + j*j+1, 2));
+
+            // Add the weighted color to the blur color
+            blurColor += Result[offsetID.xy] * weight;
+
+            // Add the weight to the weight sum
+            weightSum += weight;
+        }
+    }
+
+    // Normalize the blur color by the weight sum
+    blurColor /= weightSum;
+
+    // Write the blur color to the output image
+    Result[id.xy] = Result[id.xy] * 0.5 + blurColor * 0.5;
+    Result[id.xy] = float4(max(0, Result[id.xy].x*0.999 -0.002), 0, 0, 1);
+}
+
+[numthreads(20,1,1)]
+void Update (uint3 id : SV_DispatchThreadID)
+{
+    float senseAngleOffset = radians(35.0);
+    float directionMultiplier = 4;
+    float senseRadius = 3;
+    float turnSpeed = 0.019;
+    float extraRandomTurnSpeed = 0.02;
+    rngState = id.x + RandomSeed;
+    if (id.x >= Agents.Length)
+    {
+        return;
+    }
+    SlimeAgent a = Agents[id.x];
+    if (a.angle < 0 || a.angle > 2*PI) {
+        a.angle = a.angle % (2*PI);
+        if (a.angle < 0) {
+            a.angle += 2*PI;
+        }
+    }
+    
+    float rightAngle = a.angle + senseAngleOffset;
+    float leftAngle = a.angle - senseAngleOffset;
+
+    float2 fowardDir = float2(cos(a.angle), sin(a.angle));
+    float2 rightDir = float2(cos(rightAngle), sin(rightAngle));
+    float2 leftDir = float2(cos(leftAngle), sin(leftAngle));
+    float2 forward = a.position + directionMultiplier * fowardDir; // current direction
+    float2 right = a.position + directionMultiplier * rightDir; 
+    float2 left = a.position + directionMultiplier * leftDir; 
+    
+    
+    float forwardSense = SensePositon(forward, senseRadius);
+    float rightSense = SensePositon(right, senseRadius);
+    float leftSense = SensePositon(left, senseRadius);
+
+    float extraRandomDir = rand()*extraRandomTurnSpeed;
+    if(rand() < 0.5)
+    {
+        extraRandomDir *= -1;
+    }
+    
+    if(forwardSense > rightSense && forwardSense > leftSense)
+    {
+        a.angle += 0;
+    }
+    else if (forwardSense < rightSense && forwardSense < leftSense)
+    {
+        if(rand() >= 0.5)
+        {
+            a.angle = a.angle + turnSpeed + extraRandomDir;
+        }
+        else
+        {
+            a.angle = a.angle - turnSpeed + extraRandomDir;
+        }
+    }
+    else if (rightSense >= leftSense) 
+    {
+        a.angle = a.angle + turnSpeed + extraRandomDir;
+    } 
+    else if(leftSense >= rightSense) 
+    {
+        a.angle = a.angle - turnSpeed + extraRandomDir;
+    }
+
+    a.position += fowardDir * (rand()*0.5 + 0.5)/5;
+    if (a.position.x < 0.0 || a.position.y < 0.0  || a.position.x >= float(imageSize.x) || a.position.y >= float(imageSize.y))
+    {
+        a.angle += PI + (rand() - 0.5);
+        a.position.x = max(0, min(a.position.x, imageSize.x - 1));
+        a.position.y = max(0, min(a.position.y, imageSize.y - 1));
+    }
+
+    Result[Agents[id.x].position] += float4(100.0/Agents.Length, 0, 0, 1);
+    Agents[id.x] = a;
+}
